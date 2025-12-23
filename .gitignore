@@ -35,3 +35,5 @@ data.json
 
 # Keep reports directory structure
 !reports/.gitkeep
+.vercel
+.env*.local

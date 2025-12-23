@@ -132,6 +132,17 @@ export const config = {
         }
     },
 
+    // ===== AI & DATA SETTINGS =====
+    ai: {
+        geminiKey: process.env.GEMINI_API_KEY || '',
+        model: 'gemini-2.0-flash'
+    },
+
+    supabase: {
+        url: process.env.SUPABASE_URL || '',
+        anonKey: process.env.SUPABASE_ANON_KEY || ''
+    },
+
     // ===== UI SETTINGS =====
     ui: {
         defaultTheme: 'dark',
@@ -140,4 +151,3 @@ export const config = {
         showDemoMode: true
     }
 };
-

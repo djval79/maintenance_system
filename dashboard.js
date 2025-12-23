@@ -2,6 +2,8 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { createClient } from '@supabase/supabase-js';
 import { config } from './config.js';
 import { runAudit } from './engine.js';
 import { initScheduler, runUptimeCheck, runFullAudit, getAuditHistory } from './scheduler.js';
@@ -9,6 +11,14 @@ import { initScheduler, runUptimeCheck, runFullAudit, getAuditHistory } from './
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = 3030;
+
+// Initialize Supabase if keys are available
+const supabase = (config.supabase.url && config.supabase.anonKey)
+    ? createClient(config.supabase.url, config.supabase.anonKey)
+    : null;
+
+// Initialize Gemini if key is available
+const genAI = config.ai.geminiKey ? new GoogleGenerativeAI(config.ai.geminiKey) : null;
 const REPORTS_DIR = path.join(__dirname, 'reports');
 const DATA_FILE = path.join(__dirname, 'data.json');
 
@@ -657,8 +667,83 @@ function generateRecommendations(scores, opportunities, analysis = null) {
     };
 }
 
+// ===== AI GENERATION ENGINE =====
+async function generateAISummary(target, auditData, analysis) {
+    if (!genAI) return null;
+
+    try {
+        const model = genAI.getGenerativeModel({ model: config.ai.model });
+        const prompt = `
+            You are a technical consultant for a healthcare technology firm. 
+            Analyze the following website audit data for "${target.name}" (${target.url}) and provide a "Deep Insight" summary.
+            
+            Audit Scores:
+            - Performance: ${auditData.scores.performance}
+            - Accessibility: ${auditData.scores.accessibility}
+            - SEO: ${auditData.scores.seo}
+            - Best Practices: ${auditData.scores.bestPractices}
+            
+            Uptime: ${auditData.uptime.status} (Latency: ${auditData.uptime.latency})
+            
+            Key Issues: ${analysis.criticalIssues.map(i => i.message).join(', ')}
+            Strengths: ${analysis.strengths.map(s => s.message).join(', ')}
+            
+            Task:
+            1. Provide a professional 2-3 sentence executive perspective on why these results matter for a healthcare business (focus on reputation, risk, and revenue).
+            2. Identify one "Hidden Opportunity" that the raw numbers might not show.
+            3. Use a confident, expert, but helpful tone.
+            
+            Format as JSON: { "perspective": "...", "hiddenOpportunity": "..." }
+        `;
+
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+
+        // Extract JSON from response (handling potential markdown formatting)
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+            return JSON.parse(jsonMatch[0]);
+        }
+        return { perspective: text, hiddenOpportunity: "Optimization of core user flows." };
+    } catch (error) {
+        console.error('Error generating AI summary:', error);
+        return null;
+    }
+}
+
+// ===== SUPABASE DATA SYNC =====
+async function syncAuditToSupabase(auditData, aiSummary = null) {
+    if (!supabase) return;
+
+    try {
+        const { data, error } = await supabase
+            .from('maintenance_audits')
+            .insert([{
+                target_id: auditData.targetId,
+                client_id: auditData.clientId,
+                timestamp: auditData.timestamp,
+                performance_score: auditData.scores.performance,
+                accessibility_score: auditData.scores.accessibility,
+                best_practices_score: auditData.scores.bestPractices,
+                seo_score: auditData.scores.seo,
+                uptime_status: auditData.uptime.status,
+                latency: auditData.uptime.latency,
+                opportunities: auditData.opportunities,
+                screenshot_url: auditData.screenshot,
+                ai_perspective: aiSummary ? aiSummary.perspective : null,
+                ai_hidden_opportunity: aiSummary ? aiSummary.hiddenOpportunity : null
+            }]);
+
+        if (error) console.error('Supabase Sync Error:', error.message);
+        else console.log(`✅ Audit synced to Supabase for ${auditData.targetId}`);
+    } catch (e) {
+        console.error('Supabase Sync Failed:', e.message);
+    }
+}
+
 // ===== ENHANCED DETAILED REPORT GENERATOR =====
-function generateDetailedReport(target, auditData, analysis, recommendationsData) {
+function generateDetailedReport(target, auditData, analysis, recommendationsData, aiSummary = null) {
     const revenue = calculateRevenue(auditData.opportunities || []);
     const date = new Date(auditData.timestamp).toLocaleDateString('en-GB', {
         day: 'numeric', month: 'long', year: 'numeric'
@@ -940,6 +1025,70 @@ function generateDetailedReport(target, auditData, analysis, recommendationsData
             font-weight: 700;
             font-size: 0.9rem;
             margin-top: 12px;
+        }
+
+        /* AI Insights Section */
+        .ai-insight {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            padding: 32px;
+            border-radius: 20px;
+            margin-bottom: 28px;
+            position: relative;
+            overflow: hidden;
+        }
+        .ai-insight::after {
+            content: 'AI';
+            position: absolute;
+            top: -20px;
+            right: -10px;
+            font-size: 10rem;
+            font-weight: 900;
+            color: rgba(255,255,255,0.05);
+            pointer-events: none;
+        }
+        .ai-insight-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .ai-insight-icon {
+            width: 40px;
+            height: 40px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.4rem;
+        }
+        .ai-insight-title {
+            font-size: 1.2rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+        }
+        .ai-insight-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+        .ai-insight-box {
+            background: rgba(255,255,255,0.1);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        .ai-insight-box h5 {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 8px;
+            opacity: 0.8;
+        }
+        .ai-insight-box p {
+            font-size: 0.95rem;
+            line-height: 1.6;
         }
 
         /* Metric Details */
@@ -1318,6 +1467,26 @@ function generateDetailedReport(target, auditData, analysis, recommendationsData
             </div>
         </div>
 
+        ${aiSummary ? `
+        <!-- AI Deep Insights -->
+        <div class="ai-insight">
+            <div class="ai-insight-header">
+                <div class="ai-insight-icon">✨</div>
+                <div class="ai-insight-title">AI Deep Analysis</div>
+            </div>
+            <div class="ai-insight-content">
+                <div class="ai-insight-box">
+                    <h5>Executive Perspective</h5>
+                    <p>${aiSummary.perspective}</p>
+                </div>
+                <div class="ai-insight-box">
+                    <h5>Hidden Opportunity</h5>
+                    <p>${aiSummary.hiddenOpportunity}</p>
+                </div>
+            </div>
+        </div>
+        ` : ''}
+
         <!-- Executive Summary -->
         <div class="section">
             <div class="section-header">
@@ -1661,6 +1830,14 @@ app.post('/api/audit/:targetId', async (req, res) => {
     if (!target) return res.status(404).json({ error: 'Target not found' });
     try {
         const result = await runAudit(target, config.audit);
+
+        // Post-audit enrichment and sync
+        if (result.success) {
+            const analysis = analyzeMetrics(result.scores);
+            const aiSummary = await generateAISummary(target, result, analysis);
+            await syncAuditToSupabase(result, aiSummary);
+        }
+
         res.json(result);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1671,7 +1848,15 @@ app.post('/api/audit/all', async (req, res) => {
     try {
         const results = [];
         for (const target of getAllTargets()) {
-            results.push(await runAudit(target, config.audit));
+            const result = await runAudit(target, config.audit);
+
+            if (result.success) {
+                const analysis = analyzeMetrics(result.scores);
+                const aiSummary = await generateAISummary(target, result, analysis);
+                await syncAuditToSupabase(result, aiSummary);
+            }
+
+            results.push(result);
         }
         res.json({ success: true, results });
     } catch (err) {
@@ -1804,7 +1989,7 @@ app.get('/api/proposal', (req, res) => {
 });
 
 // ===== CLIENT REPORT API =====
-app.get('/api/report/:targetId', (req, res) => {
+app.get('/api/report/:targetId', async (req, res) => {
     const targetId = req.params.targetId;
     const target = getAllTargets().find(t => t.id === targetId);
 
@@ -1829,15 +2014,18 @@ app.get('/api/report/:targetId', (req, res) => {
     // Generate enhanced recommendations
     const recommendations = generateRecommendations(latestAudit.scores, latestAudit.opportunities || [], analysis);
 
+    // AI summary (optional based on config)
+    const aiSummary = await generateAISummary(target, latestAudit, analysis);
+
     // Generate the professional report
-    const reportHtml = generateDetailedReport(target, latestAudit, analysis, recommendations);
+    const reportHtml = generateDetailedReport(target, latestAudit, analysis, recommendations, aiSummary);
 
     res.setHeader('Content-Type', 'text/html');
     res.send(reportHtml);
 });
 
 // Generate and download report as file
-app.get('/api/report/:targetId/download', (req, res) => {
+app.get('/api/report/:targetId/download', async (req, res) => {
     const targetId = req.params.targetId;
     const target = getAllTargets().find(t => t.id === targetId);
 
@@ -1856,7 +2044,11 @@ app.get('/api/report/:targetId/download', (req, res) => {
     const historicalData = targetData.slice(1);
     const analysis = analyzeMetrics(latestAudit.scores, historicalData);
     const recommendations = generateRecommendations(latestAudit.scores, latestAudit.opportunities || [], analysis);
-    const reportHtml = generateDetailedReport(target, latestAudit, analysis, recommendations);
+
+    // AI summary
+    const aiSummary = await generateAISummary(target, latestAudit, analysis);
+
+    const reportHtml = generateDetailedReport(target, latestAudit, analysis, recommendations, aiSummary);
 
     const filename = `${target.name.replace(/[^a-z0-9]/gi, '_')}_Health_Report_${new Date().toISOString().split('T')[0]}.html`;
 
@@ -2389,15 +2581,22 @@ function getDashboardHTML() {
 }
 
 // ===== START SERVER =====
-app.listen(PORT, () => {
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('  🛡️  MAINTENANCE OS v2.0');
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log(`  ✅ Dashboard: http://localhost:${PORT}`);
-    console.log(`  🔐 Auth: ${config.auth.enabled ? 'Enabled' : 'Disabled'}`);
-    console.log(`  📧 Email: ${config.email.enabled ? 'Enabled' : 'Disabled'}`);
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+if (process.env.VERCEL) {
+    // Vercel Serverless environment
+} else {
+    // Local development
+    app.listen(PORT, () => {
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('  🛡️  MAINTENANCE OS v2.0');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log(`  ✅ Dashboard: http://localhost:${PORT}`);
+        console.log(`  🔐 Auth: ${config.auth.enabled ? 'Enabled' : 'Disabled'}`);
+        console.log(`  📧 Email: ${config.email.enabled ? 'Enabled' : 'Disabled'}`);
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
-    // Initialize scheduler if this is the main process
-    try { initScheduler(); } catch (e) { console.log('Scheduler will run separately'); }
-});
+        // Initialize scheduler if this is the main process
+        try { initScheduler(); } catch (e) { console.log('Scheduler will run separately'); }
+    });
+}
+
+export default app;
